@@ -1,0 +1,6 @@
+admin
+sa
+Password
+Password1
+P@ssw0rd
+123456

